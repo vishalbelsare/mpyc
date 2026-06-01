@@ -489,11 +489,11 @@ class secpoly(SecureObject):
         field = stype.sectype.field
         l = 1 + max(n.bit_length(), field.modulus.bit_length())  # TODO: check bit length l
         secint = runtime.SecInt(l=l)
-        delta = secint(1)
-        d = n  # deg(f)<=n-1 and deg(g)<=n-1<n
-        for i in range(2*d - 1):  # NB: 2d-1 steps suffice provided deg(f)<=d and deg(g)<d
+        delta = secint(0)
+        d = n - 1
+        for i in range(2*d):  # NB: 2d steps suffice using deg(f)<=d and deg(g)<=d
             l = (i+1).bit_length()  # TODO: check use of bit length of i+1
-            delta_gt0 = 1 - runtime.sgn((delta-1-(i%2))/2, l=l, LT=True)
+            delta_gt0 = 1 - runtime.sgn((delta + ((i%2) - 2))/2, l=l, LT=True)
             _delta_gt0 = runtime.convert(delta_gt0, stype.sectype)
             g_0 = g[0] != 0
             _g_0 = runtime.convert(g_0, secint)
@@ -519,12 +519,12 @@ class secpoly(SecureObject):
         v = q = stype(np.array([]))
         l = 1 + max(n.bit_length(), field.modulus.bit_length())  # TODO: check bit length l
         secint = runtime.SecInt(l=l)
-        delta = secint(1)
+        delta = secint(0)
         for i in range(n):
             if not g:
                 continue
             l = (i+1).bit_length()  # TODO: check use of bit length of i+1
-            delta_gt0 = 1 - runtime.sgn((delta-1-(i%2))/2, l=l, LT=True)
+            delta_gt0 = 1 - runtime.sgn((delta + ((i%2) - 2))/2, l=l, LT=True)
             _delta_gt0 = runtime.convert(delta_gt0, stype.sectype)
             g_0 = g[0] != 0
             _g_0 = runtime.convert(g_0, secint)
@@ -562,8 +562,8 @@ class secpoly(SecureObject):
         c = f[0] == 0
         f, g = runtime.np_if_swap(c, f, g)
         # f[0] != 0 ensured unless f=g=0
-        d = n  # see secpoly._gcd()
-        _, f, g, (u, v, _, _) = secpoly._divstepsx2(2*d-1, f, g)
+        d = n - 1  # see secpoly._gcd()
+        _, f, g, (u, v, _, _) = secpoly._divstepsx2(2*d, f, g)
         f, lc1 = secpoly._monic(f, lc_pinv=True)
         f = runtime.np_roll(f, e)
         u, v = runtime.np_if_swap(c, u * lc1, v * lc1)
