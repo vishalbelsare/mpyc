@@ -492,13 +492,14 @@ class secpoly(SecureObject):
         delta = secint(0)
         d = n - 1
         for i in range(2*d):  # NB: 2d steps suffice using deg(f)<=d and deg(g)<=d
-            l = (i+1).bit_length()  # TODO: check use of bit length of i+1
-            delta_gt0 = 1 - runtime.sgn((delta + ((i%2) - 2))/2, l=l, LT=True)
-            _delta_gt0 = runtime.convert(delta_gt0, stype.sectype)
-            g_0 = g[0] != 0
-            _g_0 = runtime.convert(g_0, secint)
-            f, g = secpoly._if_swap(_delta_gt0 * g_0, f, g)
-            delta *= (1 - 2 * delta_gt0 * _g_0)
+            if i:
+                l = i.bit_length()
+                delta_gt0 = 1 - runtime.sgn((delta + ((i%2) - 2))/2, l=l, LT=True)
+                _delta_gt0 = runtime.convert(delta_gt0, stype.sectype)
+                g_0 = g[0] != 0
+                _g_0 = runtime.convert(g_0, secint)
+                f, g = secpoly._if_swap(_delta_gt0 * g_0, f, g)
+                delta *= (1 - 2 * delta_gt0 * _g_0)
             g = f[0]*g - g[0]*f  # ensure g[0]=0
             g = g[1:]
             delta += 1
@@ -516,23 +517,24 @@ class secpoly(SecureObject):
         f, g = a, b
         a, b = (alpha := 1/a[0]) * a, alpha * b  # ensure a[0]=1
         u = r = stype(np.array([1]))
-        v = q = stype(np.array([]))
+        v = q = stype(np.array([0]))  # NB: force nonempty arrays
         l = 1 + max(n.bit_length(), field.modulus.bit_length())  # TODO: check bit length l
         secint = runtime.SecInt(l=l)
         delta = secint(0)
         for i in range(n):
             if not g:
                 continue
-            l = (i+1).bit_length()  # TODO: check use of bit length of i+1
-            delta_gt0 = 1 - runtime.sgn((delta + ((i%2) - 2))/2, l=l, LT=True)
-            _delta_gt0 = runtime.convert(delta_gt0, stype.sectype)
-            g_0 = g[0] != 0
-            _g_0 = runtime.convert(g_0, secint)
-            c = _delta_gt0 * g_0
-            f, g = secpoly._if_swap(c, f, g)
-            u, q = secpoly._if_swap(c, u, q)
-            v, r = secpoly._if_swap(c, v, r)
-            delta *= (1 - 2 * delta_gt0 * _g_0)
+            if i:
+                l = i.bit_length()
+                delta_gt0 = 1 - runtime.sgn((delta + ((i%2) - 2))/2, l=l, LT=True)
+                _delta_gt0 = runtime.convert(delta_gt0, stype.sectype)
+                g_0 = g[0] != 0
+                _g_0 = runtime.convert(g_0, secint)
+                c = _delta_gt0 * g_0
+                f, g = secpoly._if_swap(c, f, g)
+                u, q = secpoly._if_swap(c, u, q)
+                v, r = secpoly._if_swap(c, v, r)
+                delta *= (1 - 2 * delta_gt0 * _g_0)
             f0, g0 = f[0], g[0]
             g = f0*g - g0*f  # ensure g[0]=0
             q = f0*q - g0*u
