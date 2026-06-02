@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import pickle
 import asyncio
 from mpyc.numpy import np
+from mpyc import gmpy as gmpy2
 from mpyc import finfields
 from mpyc import thresha
 from mpyc import asyncoro
@@ -600,7 +601,7 @@ class Runtime:
         return y
 
     @asyncoro.mpc_coro
-    async def _reshare(self, x):
+    async def _reshare(self, x):  # a la [GRR98]
         x_is_list = isinstance(x, list)
         if not x_is_list:
             x = [x]
@@ -1083,11 +1084,11 @@ class Runtime:
             a = b = await self.gather(a)
         else:
             a, b = await self.gather(a, b)
-        c = a * b
+        c = a * b  # a la [BGW88]
         if f and (a_integral or b_integral) and z != f:
             c >>= f - z  # NB: in-place rshift
         if shb:
-            c = self._reshare(c)
+            c = self._reshare(c)  # a la [GRR98]
         if f and not (a_integral or b_integral) and z != f:
             c = self.trunc(stype(c), f=f - z)
         return c
@@ -1138,6 +1139,33 @@ class Runtime:
         if f and not (a_integral or b_integral) and z != f:
             c = self.np_trunc(stype(c, shape=shape), f=f - z)
         return c
+
+    @asyncoro.mpc_coro_no_pc
+    async def lshift(self, a, b):
+        """Secure left shift of a for public nonnegative integer b."""
+        stype = type(a)
+        f = stype.frac_length
+        if not f:
+            await self.returnType(stype)
+        else:
+            await self.returnType((stype, a.integral or (b >= f)))
+        a = await self.gather(a)
+        return a << b
+
+    @asyncoro.mpc_coro_no_pc
+    async def np_left_shift(self, a, b):
+        """Secure left shift of a for public nonnegative integer b, elementwise with broadcast."""
+        stype = type(a)
+        a_shape = getattr(a, 'shape', (1,))
+        b_shape = getattr(b, 'shape', (1,))
+        shape = np.broadcast_shapes(a_shape, b_shape)
+        f = stype.frac_length
+        if not f:
+            await self.returnType((stype, shape))
+        else:
+            await self.returnType((stype, a.integral or bool(np.all(b >= f)), shape))
+        a = await self.gather(a)
+        return a << b
 
     def div(self, a, b):
         """Secure division of a by b, for nonzero b."""
@@ -1266,7 +1294,7 @@ class Runtime:
         return b
 
     def pow(self, a, b):
-        """Secure exponentiation a raised to the power of b, for public integer b."""
+        """Secure exponentiation a to the power of b, for public integer b."""
         if b == 254:  # addition chain for AES S-Box (11 multiplications in 9 rounds)
             d = a
             c = self.mul(d, d)
@@ -1284,7 +1312,11 @@ class Runtime:
             return type(a)(1)
 
         if b < 0:
-            a = self.reciprocal(a)
+            # NB: generalization of self.div(1, a)=1/a=a**-1, which equals a**b for b=-1
+            if a.frac_length:
+                a = self._rec(a)
+            else:
+                a = self.reciprocal(a)
             b = -b
         d = a
         c = 1
@@ -1297,8 +1329,30 @@ class Runtime:
         return c
 
     def np_pow(self, a, b):
-        """Secure elementwise exponentiation a raised to the power of b, for public integer b."""
-        # TODO: extend to non-scalar b
+        """Secure elementwise exponentiation a to the power of b,
+        where either a or b is a public number.
+        """
+        # TODO: extend to a and b both nonscalar.
+
+        if isinstance(b, int) and b == 2:  # fast path
+            return self.np_multiply(a, a)
+
+        if isinstance(a, (int, float)):
+            if isinstance(a, int):
+                if isinstance(b, self.SecureIntegerArray) or \
+                   isinstance(b, self.SecureFixedPointArray) and b.integral:
+                    return self._np_pow_public_int_base_secret_integral_exponent(a, b)
+
+            if a != 2:
+                b *= math.log2(a)  # convert to base 2, using a^b = 2^(b log_2 a)
+            return self.np_exp2(b)
+
+        if isinstance(b, float):
+            if b.is_integer():
+                b = int(b)
+            else:
+                return self.np_exp2(self.np_log2(a) * b)  # NB: requires a>0
+
         if b == 254:  # addition chain for AES S-Box (11 multiplications in 9 rounds)
             d = a
             c = self.np_multiply(d, d)
@@ -1316,7 +1370,11 @@ class Runtime:
             return type(a)(np.ones(a.shape, dtype='O'))
 
         if b < 0:
-            a = self.np_reciprocal(a)
+            # NB: generalization of self.np_divide(1, a)=1/a=a**-1, which equals a**b for b=-1
+            if a.frac_length:
+                a = self._rec(a)
+            else:
+                a = self.np_reciprocal(a)
             b = -b
         d = a
         c = 1
@@ -1327,6 +1385,44 @@ class Runtime:
             d = d * d
         c = c * d
         return c
+
+    @asyncoro.mpc_coro
+    async def _np_pow_public_int_base_secret_integral_exponent(self, a, b):
+        """Compute a^b for public int base a and secret-shared nonnegative integral exponents b.
+
+        Similar to mpyc.secgroups.repeat_public_base_secret_output().
+        """
+        await self.returnType((type(b), True, b.shape))
+
+        p = b.sectype.field.modulus
+        m = len(self.parties)
+        t = self.threshold
+        uci = self._program_counter[0] % m
+        senders = tuple((uci + i) % m for i in range(t+1))  # NB: simple load balancing
+        if self.pid in senders:
+            # All senders locally generate random numbers r_i and compute a^(-r_i).
+            l = b.sectype.bit_length
+            k = self.options.sec_param
+            bound = 1<<(l + k) // (t+1)
+            r = np.array([secrets.randbelow(bound) for _ in range(b.size)], dtype=object)  # r_i
+            a_r = np.vectorize(int, otypes='O')(gmpy2.powmod_exp_list(a, -r, p))  # a^(-r_i)
+            r_1 = type(b)(np.vstack((r, a_r)))
+            del r, a_r
+        else:
+            r_1 = type(b)(shape=(2, b.size), integral=True)
+        r_1 = np.stack(self.input(r_1, senders=senders))
+        r = np.sum(r_1[:, 0], axis=0)
+        a_r = np.prod(r_1[:, 1], axis=0)  # a^-r
+        del r_1
+
+        f = b.sectype.frac_length
+        b, r = await self.gather(b, r)
+        c = await self.output(b.reshape(-1) + r)
+        c = c.value >> f
+        c = np.vectorize(int, otypes='O')(gmpy2.powmod_exp_list(a, c, p))  # a^(b+r)
+        c *= a_r
+        c <<= f  # a^b
+        return c.reshape(b.shape)
 
     def and_(self, a, b):
         """Secure bitwise and of a and b."""
@@ -2599,9 +2695,9 @@ class Runtime:
 
     @asyncoro.mpc_coro_no_pc
     async def np_tolist(self, a):
-        """Return array a as an nested list of Python scalars.
+        """Return array a as (nested) list of Python scalars.
 
-        The nested list is a.ndim levels deep (scalar if a.ndim is zero).
+        Nested list is a.ndim levels deep (scalar if a.ndim is zero).
         """
         stype = type(a).sectype
         if issubclass(stype, self.SecureFixedPoint):
@@ -2828,6 +2924,7 @@ class Runtime:
 
     @asyncoro.mpc_coro_no_pc
     async def np_copy(self, a, order='K'):
+        """Return copy of a."""
         # Note that numpy.copy() puts order='K', but ndarray.copy() puts order='C'.
         # Therefore, we put order='K' here and let SecureArray.copy() call np_copy() with order='C'.
         # TODO: a can be a scalar, should be wrapped in 0D array
@@ -3003,6 +3100,12 @@ class Runtime:
 
     @asyncoro.mpc_coro_no_pc
     async def np_vstack(self, tup):
+        """Stack arrays in sequence vertically (as rows).
+
+        This is equivalent to concatenation along the first axis
+        after 1D arrays of shape (N,) have been reshaped to (1,N).
+        Rebuilds arrays divided by vsplit.
+        """
         a = tup[0]
         stype = type(a)
         shape = list(a.shape) if a.ndim >= 2 else [1, a.shape[0]]
@@ -3019,11 +3122,11 @@ class Runtime:
 
     @asyncoro.mpc_coro_no_pc
     async def np_hstack(self, tup):
-        """Stack arrays in sequence horizontally (column wise).
+        """Stack arrays in sequence horizontally (as columns).
 
         This is equivalent to concatenation along the second axis,
-        except for 1D arrays where it concatenates along the first
-        axis. Rebuilds arrays divided by hsplit.
+        except for 1D arrays where it concatenates along the first axis.
+        Rebuilds arrays divided by hsplit.
         """
         i = 0
         while not isinstance(a := tup[i], self.SecureArray):
@@ -3067,6 +3170,10 @@ class Runtime:
 
     @asyncoro.mpc_coro_no_pc
     async def np_column_stack(self, tup):
+        """Stack 1D arrays as columns into a 2D array.
+
+        2D arrays are stacked as-is, just like with hstack.
+        """
         i = 0
         while not isinstance(a := tup[i], self.SecureArray):
             i += 1
@@ -3258,6 +3365,14 @@ class Runtime:
         The shapes of a, b, and c are broadcast together.
         """
         return c * (a - b) + b
+
+    def np_if_swap(self, c, a, b):
+        """Conditional swap of elements in a and b depending on condition c.
+
+        The shapes of a, b, and c are broadcast together.
+        """
+        d = c * (a - b)
+        return a - d, b + d
 
     def np_amin(self, a, axis=None, keepdims=False):
         """Secure minimum of array a, entirely or along the given axis (or axes).
@@ -4608,7 +4723,7 @@ class Runtime:
             s = 1 - x[..., -1]  # inverted sign bits
             x = x[..., :-1]
             x = np.flip(x, axis=-1)
-            nf = self.np_find(x, s, cs_f=lambda b, i: (b+1) * 2**i)  # TODO: << i for secure arrays
+            nf = self.np_find(x, s, cs_f=lambda b, i: (b+1) << i)
             return (s*2 - 1) * nf * (2**(f - (l-1)))  # NB: f <= l
 
         l = type(a).bit_length
@@ -4735,6 +4850,100 @@ class Runtime:
         s, c = self.sincos(a)
         return s / c
 
+    @staticmethod
+    @functools.cache
+    def _taylor_log_degree(f):
+        """Required degree of Taylor polynomial for log x as function of f."""
+        # Degree k s.t. maximum error 1/(k+1) w^-(k+1) <= 2^-f,
+        # that is, log2(k+1) + (k+1)log2(w) >= f, where w = 1/(sqrt(2) - 1).
+        w = 1 / (math.sqrt(2) - 1)
+        k = f - 1  # invariant: log2(k+1) + (k+1)log2(w) >= f
+        while math.log2(k) + k * math.log2(w) >= f:
+            k -= 1
+        return k
+
+    def np_log(self, a):
+        """Secure elementwise natural logarithm of fixed-point array a.
+
+        From survival analysis project with Noah van der Meer (github.com/noahmr).
+        """
+        shape = a.shape
+        if len(shape) != 1:
+            a = self.np_reshape(a, -1)
+        f = a.frac_length
+        l = a.sectype.bit_length
+        x = self.np_to_bits(a, l=l-1)  # low to high bits, ignore sign bit
+        x = self.np_flip(x, axis=-1)
+        k, v = self.np_find(x, 1, cs_f=lambda b, i: (i+1+b, (b+1) << i))
+        v *= 2**(f - (l-1))  # NB: f <= l
+        b = a * v  # 1/2 <= b < 1
+
+        # Evaluate Taylor polynomial at b around 1/sqrt(2):
+        theta = self._taylor_log_degree(f)
+        alpha = 0.5 * math.sqrt(2)
+        y = b - alpha
+        ys = self.np_vander(y, theta + 1, increasing=True)[:, 1:]  # [y^1 y^2 ... y^theta]
+        i = np.arange(1, theta + 1)  # [1 2 ... theta]
+        c = math.log(alpha) + ys @ (-1 / (i * (-alpha)**i))
+        c -= (k - f) * math.log(2)
+        if len(shape) != 1:
+            c = self.np_reshape(c, shape)
+        return c
+
+    def np_log2(self, a):
+        """Secure elementwise base 2 logarithm of fixed-point array a."""
+        return self.np_log(a) * math.log2(math.e)
+
+    def np_log10(self, a):
+        """Secure elementwise base 10 logarithm of fixed-point array a."""
+        return self.np_log(a) * math.log10(math.e)
+
+    @staticmethod
+    @functools.cache
+    def _taylor_exp2_degree(f):
+        """Required degree of Taylor polynomial for 2^x as function of f."""
+        log2ln2 = math.log2(math.log(2))
+        k = 1
+        log2factorial = 1  # invariant: log2factorial = log2 (k+1)!
+        while log2factorial - (k+1) * log2ln2 < f+1:
+            k += 1
+            log2factorial += math.log2(k + 1)
+        return k
+
+    def np_exp2(self, a):
+        """Compute 2^a, given secure fixed-point exponents a.
+
+        From survival analysis project with Noah van der Meer (github.com/noahmr).
+        """
+        shape = a.shape
+        if len(shape) != 1:
+            a = self.np_reshape(a, -1)
+        l = a.sectype.bit_length
+        f = a.sectype.frac_length
+        max_a_bit_length = f + (l-1 - f).bit_length() + 1  # 2^a <= 2^(l-1-f)
+        a_int = self.np_trunc(a, l=max_a_bit_length, f=f) << f  # integral part of a
+        a_int.integral = True
+        a_frac = a - a_int
+
+        # Taylor approximation of 2^a_frac using |a_frac|<1:
+        theta = self._taylor_exp2_degree(f)
+        y = a_frac * math.log(2)  # 2^a = exp(a log 2)
+        ys = np.vander(y, theta + 1, increasing=True)  # [y^0 y^1 ... y^theta]
+        i = np.arange(1, theta + 1)
+        coefficients = 1 / np.cumulative_prod(i, include_initial=True)  # [1/0! 1/1! ... 1/theta!]
+        c = ys @ coefficients  # 2^a_frac
+
+        a_int += 2**(l-1-f)  # ensure nonnegative a_int
+        c *= self.np_pow(2, a_int)  # * 2^a_int
+        c /= a.sectype.field(2)**(1<<(l-1-f))
+        if len(shape) != 1:
+            c = self.np_reshape(c, shape)
+        return c  # 2^a
+
+    def np_exp(self, a):
+        """Secure elementwise (natural) exponential function of a."""
+        return self.np_exp2(a * math.log2(math.e))
+
     def np_vander(self, a, N=None, increasing=False):
         """Securely generate Vandermonde matrix for given 1D array a.
 
@@ -4820,11 +5029,13 @@ class Runtime:
         return u
 
     def set_protocol(self, peer_pid, protocol):
+        """Register connection with given peer."""
         self.parties[peer_pid].protocol = protocol
         if all(p.protocol is not None for p in self.parties if p.pid != self.pid):
             self.parties[self.pid].protocol.set_result(None)
 
     def unset_protocol(self, peer_pid):
+        """Deregister connection with given peer."""
         self.parties[peer_pid].protocol = None
         if all(p.protocol is None for p in self.parties if p.pid != self.pid):
             self.parties[self.pid].protocol.set_result(None)
